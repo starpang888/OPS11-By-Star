@@ -1,0 +1,24 @@
+{
+  "repository": "https://github.com/xioTechnologies/Fusion",
+  "commit": "a8d7224f36a0ec82345ef49a3db50e65f8d3bab8",
+  "license": "MIT",
+  "sha256": {
+    "Fusion.h": "5e781bcc6d277487cb9f6f560290ce9bdf96e2316ab9911bc3c3e382de65e1ec",
+    "FusionAhrs.c": "611678dbaa531db3b360cf3f3097a52cd60d7cf2f93be0753748d8674b9cb5fb",
+    "FusionAhrs.h": "fd726d91ece9a5a0074151e5b777aa9578fe3f365a03b94be7d62e4084d23200",
+    "FusionBias.c": "b6409e21bc1a1590e46fd01cd93edae5e0d04494081c4182a48a6116de53e3e0",
+    "FusionBias.h": "88f8f5ebb99c315da39929b57dc8f8695e8a2aff6b2fd1474f84163a095e4868",
+    "FusionCompass.c": "0b431be6d8af609e219eae7f45cacc1ab6dd03db683b2a584c442b93b57d7086",
+    "FusionCompass.h": "39607da574532e16217d2bb667dfa52cc07b3ee9949c280fe4b4415fd9a55d08",
+    "FusionConfig.h": "1042ea5f363551d774a339e53c7cc4ce4cb1a5b90eb8fdda19d5ac2e8009ccd6",
+    "FusionConvention.c": "69356ff3bcf7d22f0bb12df9ba3cc1afc8a3e1bd627eef1f1f237cf7e64a5d65",
+    "FusionConvention.h": "781f26fb04d3d0bee5070c5e4e13f6f6fb953a57368e83a6b9bc87da3e266a3c",
+    "FusionInline.h": "4911c37b8876066054345307f91e6ad015c3b261b036fab619dcd090b45b7dd1",
+    "FusionMath.h": "c7f8a14111418ccc2e8c81ab7718baa7c2b3a6f87756954a2922579405d056a0",
+    "FusionModel.h": "36a146dd7b343b2afb870b1546bcbd5f74dfdae26ea2dfbc73ba4823e8759cde",
+    "FusionRemap.c": "9cde0ce739782c3f55e6d517ba875746462f0d3f72e35a2b6f92bf67ae4fb46e",
+    "FusionRemap.h": "2073d51f81e651b0f8f0df5e44796f5f959560d24ea4e63739f99bc4c404787e",
+    "LICENSE.md": "deea99a9e5920dc1cb5bfd7730fba6ca3fdab691bde7760aa1642e65c650ccca",
+    "README.md": "072189afe2165c1e53cfd422c9fd4b53d9b40e6e9bd513033d08f9ca027d001d"
+  }
+}
