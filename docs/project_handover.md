@@ -6,7 +6,7 @@
 
 | 项目 | 当前配置 | 修改位置 |
 | --- | --- | --- |
-| IMU | G354，SPI3，DRDY，500 Hz，论文 KF/RK2 | `application/imu_config.h`、`modules/g354/` |
+| IMU | G354，SPI3，DRDY，500 Hz，自适应角速度 KF、静止零偏修正、Heun RK2 | `application/imu_config.h`、`modules/g354/` |
 | 角速度死区 | 三轴 0.3 °/s，暂用值 | `application/imu_config.h` |
 | 温漂模型 | 默认关闭，需本机标定 | `application/imu_config.h` |
 | 前后轮 / 左右轮 | SPI1/PA4、SPI2/PB12，各 1 kHz DMA | `application/encoder_config.h` |

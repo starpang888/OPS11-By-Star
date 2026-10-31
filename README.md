@@ -2,7 +2,7 @@
 
 当前为收尾配置：编码器启动读法对比和运行期配置诊断默认关闭，保留启动配置、每帧 CRC/报警、DMA 超时恢复。里程计支持有界的同步等待与恢复，串口协议保持不变。参数清单、状态处理及待装车验收项目见 [工程收尾说明](docs/project_handover.md)。本次收尾代码已通过 Debug 编译，尚未烧录验证。
 
-STM32F407VET6、FreeRTOS、Epson M-G354PDH0，使用论文的自适应角速度 KF、联合静止零偏修正和二阶 Runge-Kutta 四元数积分，输出相对开机姿态的 ZXY 欧拉角。
+STM32F407VET6、FreeRTOS、Epson M-G354PDH0，IMU 姿态算法采用自适应角速度卡尔曼滤波、联合静止零偏修正和二阶 Runge-Kutta 四元数积分，输出相对开机姿态的 ZXY 欧拉角。
 本版于 2026-10-31 替换 Fusion；固件编译通过，尚未进行本版上板验证。详细参数、公式修正和温漂标定方法见 [姿态模块说明](modules/attitude/README.md)。
 
 已接入两个 MT6826S 编码器，分别使用 SPI1/PA4 和 SPI2/PB12，各自用独立任务进行标称 1000 Hz 单圈角度采样，提供 CRC 校验、报警统计和实际读取频率。
@@ -10,6 +10,8 @@ STM32F407VET6、FreeRTOS、Epson M-G354PDH0，使用论文的自适应角速度 
 用户已反馈双路角度、多圈位移和转速数据正常；本次关闭开发诊断的收尾配置仍待上板确认。详见 [MT6826S 接入说明](modules/mt6826s/README.md)。
 
 已加入第一版双随动轮平面里程计：SPI1 测前后、SPI2 测左右，两轮直径 58 mm，结合 IMU 航向输出底盘中心的 `g_odometry.x_mm / y_mm / yaw_deg`。使用公共时间端点、计数历史插值和旋转偏置补偿，标称 500 Hz 更新，待装车确认计数符号与动态精度。参数、流程图和调试方法见 [平面里程计说明](modules/odometry/README.md)。
+
+定位结构见 [平面定位概览](docs/planar_localization_study.md)，完整的滤波、四元数积分、安装几何推导与标定步骤见 [算法与标定详细说明](docs/planar_localization_detailed_study.md)。
 
 ## 代码分层
 
@@ -189,7 +191,7 @@ ZXY 的 Roll 范围约为 ±90 度，Pitch/Yaw 约为 ±180 度；Roll 接近 ±
 Yaw 是相对启动航向，不具备地理北向含义，也不是多圈累计角；六轴输入无法消除其长期漂移。
 
 使用 450 dps 过量程检查。运行时静止检测采用死区前 0.04 dps 门限、连续约 100 ms、加速度模长误差小于 0.03 g，并要求两轮健康且静止。
-确认静止后以 0.02 dps/s 的限速更新剩余零偏。按用户选择，当前三轴死区 `IMU_GYRO_DEADBAND_DPS=0.3f`，每轴低于 0.3 dps 的角速度归零；这是暂用门限，之后有转台再标定。论文参考值为 0.15 dps。
+确认静止后以 0.02 dps/s 的限速更新剩余零偏。按用户选择，当前三轴死区 `IMU_GYRO_DEADBAND_DPS=0.3f`，每轴绝对值低于 0.3 dps 的角速度归零；这是暂用门限，之后有转台再标定。
 温漂系数需要本机实测，默认禁用温度模型。通过 `g_imu_command` 可启动采集、拟合和应用；步骤见姿态模块说明，标定点暂存 RAM，经确认的系数写入配置后重新编译保存。
 
 丢帧、跨周期读取或陀螺仪过量程会让 `tracking_continuous` 保持 false。
@@ -214,3 +216,4 @@ cmake --build --preset Debug --parallel 4
 - 固定提交：`a8d7224f36a0ec82345ef49a3db50e65f8d3bab8`
 - 许可证：`modules/fusion/vendor/LICENSE.md`（MIT）
 - 原始文件 SHA-256：`modules/fusion/vendor/UPSTREAM.json`
+- 附带 README 的算法介绍已作本地文字调整；修改说明记录在 `UPSTREAM.json`，原始文件哈希仍保留供溯源。
