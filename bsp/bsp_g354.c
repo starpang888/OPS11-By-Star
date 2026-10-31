@@ -1,3 +1,6 @@
+/** @file bsp_g354.c
+ * @brief BSP 层 G354 硬件适配。DRDY 中断只记时间并通知任务，SPI 读取在任务中完成。
+ */
 #include "bsp_g354.h"
 #include "bsp_time.h"
 
@@ -18,7 +21,7 @@ static void chip_select(void *context, bool active) {
 
 static bool transfer(void *context, uint16_t tx, uint16_t *rx) {
     (void)context;
-    /* HAL's Size argument counts 16-bit words with SPI_DATASIZE_16BIT. */
+    /* SPI 为 16 位数据宽度，HAL 的 Size=1 表示一个 16 位字，不是一个字节。 */
     return HAL_SPI_TransmitReceive(&hspi3, (uint8_t *)&tx, (uint8_t *)rx, 1, 5) == HAL_OK;
 }
 
@@ -35,13 +38,13 @@ static void delay_us(void *context, uint32_t us) {
     (void)context;
     const uint32_t start = bsp_g354_micros();
     while ((uint32_t)(bsp_g354_micros() - start) < us) {
-        /* Short protocol delays; TIM2 keeps running during task preemption. */
+        /* 协议要求的微秒短延时；被抢占时 TIM2 仍计时，因此实际等待可能更长。 */
     }
 }
 
 static void delay_ms(void *context, uint32_t ms) {
     (void)context;
-    /* One extra tick avoids shortening minimum /RST and recovery times at a tick boundary. */
+    /* 多等一个 tick，避免 tick 边界让复位低电平或恢复等待短于手册下限。 */
     vTaskDelay(pdMS_TO_TICKS(ms) + 1U);
 }
 
@@ -115,6 +118,7 @@ uint32_t bsp_g354_spi_error(void) {
 }
 
 void HAL_GPIO_EXTI_Callback(uint16_t pin) {
+    /* 中断中不做 SPI 访问和解算；唤醒 IMU 任务后由任务确认数据是否连续。 */
     if ((pin == G354_DRDY_Pin) && (drdy_task != NULL)) {
         BaseType_t higher_priority_task_woken = pdFALSE;
         last_drdy_us = bsp_g354_micros();

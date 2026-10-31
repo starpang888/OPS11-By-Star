@@ -1,3 +1,6 @@
+/** @file odometry.c
+ * @brief modules 层平面位姿积分。累计计数差转轮子位移，补偿安装偏置后转入初始世界坐标。
+ */
 #include "odometry.h"
 #include <math.h>
 #include <stddef.h>
@@ -33,7 +36,7 @@ bool odometry_init(odometry_t *o, const odometry_config_t *c) {
         }
     }
     const double determinant = u[0][0] * u[1][1] - u[0][1] * u[1][0];
-    if (fabs(determinant) < 0.1) { /* Reject nearly parallel rolling directions. */
+    if (fabs(determinant) < 0.1) { /* 拒绝接近平行的滚动方向，避免矩阵求逆放大误差。 */
         return false;
     }
     memset(o, 0, sizeof(*o));
@@ -60,8 +63,8 @@ bool odometry_update(odometry_t *o, const odometry_position_t p[2], double yaw_d
     }
     double distance[2];
     for (unsigned i = 0; i < 2; ++i) {
-        /* Nearby anchors must differ by less than one revolution; this also
-           prevents signed subtraction overflow if a caller changes origins. */
+        /* 相邻更新的整数锚点差不能超过一圈；先算无符号幅值，也避免更换原点时
+           直接进行有符号减法引起溢出。 */
         const uint64_t magnitude = p[i].counts >= o->previous[i].counts ?
             (uint64_t)p[i].counts - (uint64_t)o->previous[i].counts :
             (uint64_t)o->previous[i].counts - (uint64_t)p[i].counts;
@@ -73,10 +76,12 @@ bool odometry_update(odometry_t *o, const odometry_position_t p[2], double yaw_d
         distance[i] = (delta + p[i].fraction - o->previous[i].fraction) * o->mm_per_count[i];
     }
     const double dtheta = wrap(yaw - o->previous_yaw_rad);
+    /* 交点 C 的平移换算到底盘中心 O：dx_O=dx_C+cy*dtheta，dy_O=dy_C-cx*dtheta。 */
     const double dx = o->inverse[0][0] * distance[0] + o->inverse[0][1] * distance[1] +
         o->config.intersection_y_mm * dtheta;
     const double dy = o->inverse[1][0] * distance[0] + o->inverse[1][1] * distance[1] -
         o->config.intersection_x_mm * dtheta;
+    /* 用区间中点航向将机体系位移旋转到开机世界坐标系。 */
     const double midpoint = o->yaw_rad + 0.5 * dtheta;
     const double x = o->x_mm + cos(midpoint) * dx - sin(midpoint) * dy;
     const double y = o->y_mm + sin(midpoint) * dx + cos(midpoint) * dy;

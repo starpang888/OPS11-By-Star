@@ -1,8 +1,13 @@
+/** @file encoder_app.c
+ * @brief application 层双编码器采样任务。每路独占 SPI，1 kHz DMA 采样后发布角度与运动量。
+ *        CRC/报警合格才更新健康时间戳，随后向 IMU 静止判据和里程计提交累计计数。
+ */
 #include "encoder_app.h"
 
 #include "bsp_mt6826s.h"
 #include "encoder_config.h"
 #include "odometry_app.h"
+#include "attitude_wheel_gate.h"
 #include "main.h"
 #include "cmsis_os.h"
 #include "FreeRTOS.h"
@@ -32,6 +37,24 @@ static encoder_instance_t encoder_instances[ENCODER_COUNT] = {
     { .bsp_id = BSP_MT6826S_1, .published = &g_encoder },
     { .bsp_id = BSP_MT6826S_2, .published = &g_encoder2 }
 };
+
+/* 每路静止窗口由自己的采样任务更新，跨任务访问时使用短临界区。 */
+static attitude_wheel_gate_t stationary_wheels[ENCODER_COUNT];
+
+uint8_t encoder_app_stationary_block_mask(uint32_t now_us) {
+    uint8_t mask = 0;
+    taskENTER_CRITICAL();
+    for (unsigned i = 0; i < ENCODER_COUNT; ++i) {
+        const attitude_wheel_gate_t *g = &stationary_wheels[i];
+        /* IMU 记录时间后编码器可能先完成一次采样，因此允许很小的负年龄差。 */
+        const int32_t age = (int32_t)(now_us - g->last_sample_us);
+        if (!g->valid || !g->stationary || age >= (int32_t)ENCODER_STATIONARY_STALE_US || age < -2000) {
+            mask |= (uint8_t)(4U << i);
+        }
+    }
+    taskEXIT_CRITICAL();
+    return mask;
+}
 
 static void publish(encoder_instance_t *instance) {
     (void)bsp_mt6826s_get_dma_stats(instance->bsp_id, &instance->output.dma);
@@ -71,6 +94,7 @@ bool encoder_app_reset_motion(encoder_id_t id) {
     return started;
 }
 
+#if ENCODER_STARTUP_REGISTER_CHECK_ENABLED
 static bool checked_frame(mt6826s_status_t status) {
     return (status == MT6826S_OK) || (status == MT6826S_ERROR_ALARM);
 }
@@ -108,8 +132,10 @@ static void check_register_reads(const mt6826s_bus_t *bus, encoder_register_chec
     }
     check->timestamp_ms = HAL_GetTick();
 }
+#endif
 
-static void read_diagnostics(const mt6826s_bus_t *bus, encoder_output_t *output) {
+/* 启动配置读取、可选读法对比及 BW 设置，都在正式周期采样之前执行。 */
+static void read_startup_diagnostics(const mt6826s_bus_t *bus, encoder_output_t *output) {
     output->diagnostics_status = mt6826s_read_diagnostics(bus, &output->diagnostics);
     output->diagnostics_read_ok = output->diagnostics_status == MT6826S_OK;
     if (output->diagnostics_read_ok) {
@@ -117,11 +143,14 @@ static void read_diagnostics(const mt6826s_bus_t *bus, encoder_output_t *output)
     } else {
         ++output->diagnostics_io_errors;
     }
+    bool communication_checked = output->diagnostics_read_ok;
+#if ENCODER_STARTUP_REGISTER_CHECK_ENABLED
     check_register_reads(bus, &output->register_check);
+    communication_checked = communication_checked && output->register_check.passed;
+#endif
     if (ENCODER_BANDWIDTH_CHANGE_ENABLED && !output->bandwidth_change_evaluated &&
-        output->diagnostics_read_ok && output->register_check.passed) {
-        /* A fresh read inside the driver checks BW again before any write.
-           Do not retry an uncertain write or a failed read-back this boot. */
+        communication_checked) {
+        /* 驱动写入前会再次读取当前 BW；本次启动不重复尝试结果不确定的写入或回读。 */
         output->bandwidth_change_evaluated = true;
         output->bandwidth_change_status = mt6826s_set_bandwidth(
             bus, 0U, ENCODER_BANDWIDTH_TARGET, &output->bandwidth_change);
@@ -160,10 +189,15 @@ static void encoder_task(void const *argument) {
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
-    /* Power-up preparation is typically 3 ms. Allow 10 ms plus tick alignment. */
+    /* 芯片典型上电准备时间约 3 ms，这里留出 10 ms 并补一个 tick 对齐余量。 */
     vTaskDelay(pdMS_TO_TICKS(ENCODER_STARTUP_DELAY_MS) + 1U);
-    read_diagnostics(&bus, output);
+    read_startup_diagnostics(&bus, output);
+#if ENCODER_RUNTIME_DIAGNOSTICS_ENABLED
     uint32_t last_diagnostics_ms = HAL_GetTick();
+    mt6826s_diagnostics_t pending_diagnostics = {0};
+    unsigned diagnostic_step = 0U;
+    bool diagnostics_active = false;
+#endif
     uint32_t rate_window_ms = HAL_GetTick();
     uint32_t rate_window_attempts = output->attempts;
     TickType_t last_wake = xTaskGetTickCount();
@@ -246,21 +280,47 @@ static void encoder_task(void const *argument) {
             }
         }
         output->motion = instance->motion.output;
-        /* motion.valid describes the ENTIRE accumulated path and stays false
-           after any past loss. Odometry has its own origin and may start from
-           a later healthy segment. Notify each segment boundary explicitly,
-           so an already established odometry origin still latches loss. */
+        /* motion.valid 描述编码器从自身原点起的整段累计轨迹，历史中断后不会自行恢复。
+           里程计可以另建原点，因此提交当前健康片段，同时显式通知片段重置/中断边界，
+           避免已经开始的定位把不连续计数当成连续运动。 */
         const bool segment_changed = reset_requested ||
             output->motion.discontinuities != discontinuities_before;
+        taskENTER_CRITICAL();
+        attitude_wheel_gate_update(&stationary_wheels[(unsigned)instance->bsp_id], latch_us,
+            output->motion.total_counts,
+            output->valid && output->motion.initialized && instance->motion.have_previous,
+            segment_changed, ENCODER_STATIONARY_STEP_COUNTS, ENCODER_STATIONARY_RANGE_COUNTS);
+        taskEXIT_CRITICAL();
         odometry_app_submit_encoder((unsigned)instance->bsp_id, latch_us,
             output->motion.total_counts,
             output->valid && output->motion.initialized && instance->motion.have_previous,
             segment_changed);
-        if ((uint32_t)(HAL_GetTick() - last_diagnostics_ms) >= ENCODER_DIAGNOSTICS_PERIOD_MS) {
+#if ENCODER_RUNTIME_DIAGNOSTICS_ENABLED
+        if (!diagnostics_active &&
+            (uint32_t)(HAL_GetTick() - last_diagnostics_ms) >= ENCODER_DIAGNOSTICS_PERIOD_MS) {
             last_diagnostics_ms = HAL_GetTick();
-            read_diagnostics(&bus, output);
+            pending_diagnostics = (mt6826s_diagnostics_t){0};
+            diagnostic_step = 0U;
+            diagnostics_active = true;
         }
-        output->motion = instance->motion.output;
+        if (diagnostics_active) {
+            /* 开发诊断开启时每周期最多追加一次传输，避免批量访问挤占 1 kHz 采样。
+               四寄存器锁存角度核对不能与周期 Burst 交错，只能在启动阶段执行。 */
+            const mt6826s_status_t status = mt6826s_read_diagnostic_step(
+                &bus, diagnostic_step, &pending_diagnostics);
+            output->diagnostics_status = status;
+            if (status != MT6826S_OK) {
+                output->diagnostics_read_ok = false;
+                ++output->diagnostics_io_errors;
+                diagnostics_active = false;
+            } else if (++diagnostic_step == 3U) {
+                output->diagnostics = pending_diagnostics;
+                output->diagnostics_read_ok = true;
+                output->diagnostics_timestamp_ms = HAL_GetTick();
+                diagnostics_active = false;
+            }
+        }
+#endif
         const uint32_t rate_elapsed_ms = (uint32_t)(HAL_GetTick() - rate_window_ms);
         if (rate_elapsed_ms >= 1000U) {
             output->measured_read_rate_hz = (float)(uint32_t)(output->attempts - rate_window_attempts) *
@@ -269,10 +329,8 @@ static void encoder_task(void const *argument) {
             rate_window_attempts = output->attempts;
         }
         publish(instance);
-        /* At exactly the next deadline, delay-until must return immediately.
-           Adding another period there halves acquisition to 500 Hz. On a
-           genuinely missed deadline, acquire once now and rebase the schedule
-           to now; do not emit a burst of catch-up transfers. */
+        /* 恰好到下一截止 tick 时应立即采样，不能再额外等待一拍，否则会降为 500 Hz。
+           真正错过周期时重新对齐，不突发补采已经错过的历史时刻。 */
         const TickType_t now = xTaskGetTickCount();
         if ((TickType_t)(now - last_wake) > pdMS_TO_TICKS(ENCODER_SAMPLE_PERIOD_MS)) {
             last_wake = now - pdMS_TO_TICKS(ENCODER_SAMPLE_PERIOD_MS);
@@ -282,7 +340,7 @@ static void encoder_task(void const *argument) {
 }
 
 bool encoder_app_start(void) {
-    /* CMSIS-RTOS v1's FreeRTOS adapter interprets stacksize as StackType_t words. */
+    /* CMSIS-RTOS v1 的此适配器按 StackType_t 字数解释栈大小，不是字节数。 */
     osThreadDef(encoderTask, encoder_task, osPriorityNormal, 0, ENCODER_TASK_STACK_WORDS);
     osThreadDef(encoder2Task, encoder_task, osPriorityNormal, 0, ENCODER_TASK_STACK_WORDS);
     const osThreadDef_t *definitions[ENCODER_COUNT] = {

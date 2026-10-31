@@ -1,3 +1,7 @@
+/** @file odometry_app.c
+ * @brief application 层里程计同步任务。用 IMU 时间点查找两轮前后样本，插值后做平面积分。
+ *        短时同步拒绝允许有界续接；计数或姿态真正不连续时保留坐标并报告跟踪丢失。
+ */
 #include "odometry_app.h"
 #include "odometry_config.h"
 #include "odometry.h"
@@ -70,7 +74,7 @@ void odometry_app_submit_imu(uint32_t timestamp_us, float yaw_deg, bool valid) {
         if (yaw_size == ODOMETRY_IMU_QUEUE) {
             ++overruns;
             ++generations[2];
-            /* Drop oldest; an established pose will latch tracking loss. */
+            /* 队列满时丢最旧端点并改变代次；已建立的定位据此判定连续性丢失。 */
             --yaw_size;
         }
         yaw_queue[yaw_head] = (yaw_sample_t){ timestamp_us, generations[2], yaw_deg };
@@ -93,7 +97,8 @@ bool odometry_app_get_output(odometry_output_t *output) {
     taskENTER_CRITICAL();
     *output = g_odometry;
     taskEXIT_CRITICAL();
-    output->valid = output->valid &&
+    output->valid = output->valid && output->tracking_continuous &&
+        output->state == ODOMETRY_STATE_RUNNING && output->error == ODOMETRY_ERROR_NONE &&
         (uint32_t)(bsp_time_micros() - output->timestamp_us) < ODOMETRY_STALE_AFTER_US;
     return output->valid;
 }
@@ -106,8 +111,7 @@ bool odometry_app_reset(void) {
     return started;
 }
 
-/* All timestamp comparisons span only the short history. Unsigned subtraction
-   and signed ordering remain valid across the 32-bit TIM2 rollover. */
+/* 只比较短历史内的时间戳；无符号相减和有符号先后判断可跨越 TIM2 的 uint32_t 回绕。 */
 static void read_input(input_t *input) {
     memset(input, 0, sizeof(*input));
     taskENTER_CRITICAL();
@@ -143,8 +147,8 @@ static void read_input(input_t *input) {
 
 static void pop_yaw(uint32_t time) {
     taskENTER_CRITICAL();
-    /* A producer overflow can replace the oldest while math runs. Do not pop
-       the replacement; the generation check will report the loss next pass. */
+    /* 计算期间生产者可能因溢出替换最旧端点；只弹出同一时间戳，不能误删替换后的端点。
+       下一次代次检查会识别该次连续性丢失。 */
     if (yaw_size != 0 &&
         yaw_queue[(yaw_head + ODOMETRY_IMU_QUEUE - yaw_size) % ODOMETRY_IMU_QUEUE].time == time) {
         --yaw_size;
@@ -166,6 +170,7 @@ static void lose_tracking(odometry_output_t *out, odometry_error_t error) {
 
 static odometry_sync_failure_t interpolate(const input_t *input, odometry_position_t positions[2],
                                            uint32_t gaps[2], uint8_t *mask) {
+    /* 每路必须有真实前后样本，且代次一致、时间跨度合格、计数差无半圈歧义。 */
     *mask = 0;
     for (unsigned i = 0; i < 2; ++i) {
         gaps[i] = input->bracket[i] ? input->upper[i].time - input->lower[i].time : 0;
@@ -202,16 +207,36 @@ static odometry_sync_failure_t interpolate(const input_t *input, odometry_positi
     return ODOMETRY_SYNC_NONE;
 }
 
-static void record_sync_failure(odometry_output_t *out, odometry_sync_failure_t reason,
-                                uint8_t mask, uint32_t age, uint32_t interval,
-                                const uint32_t gaps[2]) {
+static void record_sync_detail(odometry_output_t *out, odometry_sync_failure_t reason,
+                               uint8_t mask, uint32_t age, uint32_t interval,
+                               const uint32_t gaps[2]) {
     out->sync_failure = reason;
     out->sync_input_mask = mask;
     out->failure_age_us = age;
     out->failure_interval_us = interval;
     out->failure_bracket_us[0] = gaps == NULL ? 0 : gaps[0];
     out->failure_bracket_us[1] = gaps == NULL ? 0 : gaps[1];
+}
+
+static void record_sync_failure(odometry_output_t *out, odometry_sync_failure_t reason,
+                                uint8_t mask, uint32_t age, uint32_t interval,
+                                const uint32_t gaps[2]) {
+    record_sync_detail(out, reason, mask, age, interval, gaps);
     lose_tracking(out, ODOMETRY_ERROR_SYNC);
+}
+
+/* 只拒绝该插值端点，不重置原点，也不外推。
+   下一成功更新仍从上一成功位姿计算累计计数差和连续航向差，因此不丢弃中间位移。 */
+static void skip_sync_endpoint(odometry_output_t *out, bool *recovering,
+                               odometry_sync_failure_t reason, uint8_t mask,
+                               uint32_t age, uint32_t interval, const uint32_t gaps[2]) {
+    record_sync_detail(out, reason, mask, age, interval, gaps);
+    out->valid = false;
+    out->state = ODOMETRY_STATE_WAITING;
+    out->error = ODOMETRY_ERROR_SYNC;
+    out->wait_reason = ODOMETRY_WAIT_SYNC;
+    ++out->skipped_sync_samples;
+    *recovering = true;
 }
 
 static void odometry_task(void const *argument) {
@@ -235,6 +260,7 @@ static void odometry_task(void const *argument) {
         out.error = ODOMETRY_ERROR_CONFIG;
     }
     uint32_t reference_generation[3] = {0};
+    bool recovering_sync = false;
     uint32_t rate_start = bsp_time_micros(), rate_updates = 0;
     for (;;) {
         ++out.task_cycles;
@@ -249,11 +275,12 @@ static void odometry_task(void const *argument) {
         if (reset && out.state != ODOMETRY_STATE_ERROR) {
             const uint32_t resets = out.resets + 1U;
             out = (odometry_output_t){ .resets = resets };
+            recovering_sync = false;
             (void)odometry_init(&odometry, &config);
             rate_start = bsp_time_micros();
             rate_updates = 0;
         }
-        /* Bounded work per wake. Usually consumes one 500 Hz IMU endpoint. */
+        /* 每次唤醒处理量有上限，正常情况下约消费一个 500 Hz IMU 端点。 */
         for (unsigned work = 0; work < ODOMETRY_IMU_QUEUE; ++work) {
             if (out.state == ODOMETRY_STATE_ERROR || out.state == ODOMETRY_STATE_TRACKING_LOST) {
                 break;
@@ -273,7 +300,8 @@ static void odometry_task(void const *argument) {
                 break;
             }
             if (!input.have_yaw) {
-                out.wait_reason = odometry.initialized ? ODOMETRY_WAIT_NONE : ODOMETRY_WAIT_IMU;
+                out.wait_reason = !odometry.initialized ? ODOMETRY_WAIT_IMU :
+                    recovering_sync ? ODOMETRY_WAIT_SYNC : ODOMETRY_WAIT_NONE;
                 if (odometry.initialized && (uint32_t)(now - out.timestamp_us) >= ODOMETRY_STALE_AFTER_US) {
                     record_sync_failure(&out, ODOMETRY_SYNC_NO_IMU, 4U,
                                         now - out.timestamp_us, 0, NULL);
@@ -288,27 +316,35 @@ static void odometry_task(void const *argument) {
             if (sync != ODOMETRY_SYNC_NONE) {
                 out.wait_reason = input.wheel_samples[0] == 0 ? ODOMETRY_WAIT_ENCODER_1 :
                     input.wheel_samples[1] == 0 ? ODOMETRY_WAIT_ENCODER_2 : ODOMETRY_WAIT_SYNC;
-                if (age < ODOMETRY_SYNC_TIMEOUT_US) {
-                    break; /* Wait for an actual upper bracket; never extrapolate. */
+                if (sync == ODOMETRY_SYNC_NO_BRACKET && age < ODOMETRY_SYNC_TIMEOUT_US) {
+                    break; /* 等实际后侧编码器样本到达，不用外推代替测量。 */
                 }
                 pop_yaw(input.yaw.time);
                 if (odometry.initialized) {
-                    record_sync_failure(&out, sync, sync_mask, age,
-                                        input.yaw.time - out.timestamp_us, gaps);
-                    break;
+                    if (sync == ODOMETRY_SYNC_NO_BRACKET ||
+                        sync == ODOMETRY_SYNC_BRACKET_TOO_WIDE) {
+                        skip_sync_endpoint(&out, &recovering_sync, sync, sync_mask, age,
+                                           input.yaw.time - out.timestamp_us, gaps);
+                    } else {
+                        record_sync_failure(&out, sync, sync_mask, age,
+                                            input.yaw.time - out.timestamp_us, gaps);
+                        break;
+                    }
                 }
-                continue; /* Startup: choose a later, supported common origin. */
+                continue; /* 启动时可继续寻找后续被两轮历史支持的公共原点。 */
             }
-            if (age >= ODOMETRY_SYNC_TIMEOUT_US || (odometry.initialized &&
-                ((uint32_t)(input.yaw.time - out.timestamp_us) == 0 ||
-                 (uint32_t)(input.yaw.time - out.timestamp_us) > ODOMETRY_IMU_MAX_INTERVAL_US))) {
+            const uint32_t interval = input.yaw.time - out.timestamp_us;
+            if (odometry.initialized &&
+                (interval == 0U || interval > ODOMETRY_IMU_MAX_INTERVAL_US)) {
+                pop_yaw(input.yaw.time);
+                record_sync_failure(&out, ODOMETRY_SYNC_IMU_INTERVAL, 4U, age, interval, gaps);
+                break;
+            }
+            if (age >= ODOMETRY_SYNC_TIMEOUT_US) {
                 pop_yaw(input.yaw.time);
                 if (odometry.initialized) {
-                    record_sync_failure(&out, age >= ODOMETRY_SYNC_TIMEOUT_US ?
-                        ODOMETRY_SYNC_TOO_OLD : ODOMETRY_SYNC_IMU_INTERVAL,
-                        age >= ODOMETRY_SYNC_TIMEOUT_US ? 0U : 4U, age,
-                        input.yaw.time - out.timestamp_us, gaps);
-                    break;
+                    skip_sync_endpoint(&out, &recovering_sync, ODOMETRY_SYNC_TOO_OLD,
+                                       0U, age, interval, gaps);
                 }
                 continue;
             }
@@ -331,7 +367,17 @@ static void odometry_task(void const *argument) {
             out.error = ODOMETRY_ERROR_NONE;
             out.valid = true;
             out.tracking_continuous = true;
+            out.wait_reason = ODOMETRY_WAIT_NONE;
+            if (recovering_sync) {
+                ++out.sync_recoveries;
+                recovering_sync = false;
+            }
             ++out.updates;
+        }
+        if (recovering_sync && out.state == ODOMETRY_STATE_WAITING &&
+            (uint32_t)(bsp_time_micros() - out.timestamp_us) >= ODOMETRY_STALE_AFTER_US) {
+            /* 超过新鲜度窗口仍未恢复：保留同步首因，锁存跟踪丢失并维持坐标无效。 */
+            lose_tracking(&out, ODOMETRY_ERROR_SYNC);
         }
         const uint32_t elapsed = bsp_time_micros() - rate_start;
         if (elapsed >= 1000000U) {
@@ -348,7 +394,8 @@ bool odometry_app_start(void) {
     if (task_handle != NULL) {
         return true;
     }
-    osThreadDef(odometryTask, odometry_task, osPriorityNormal, 0, ODOMETRY_TASK_STACK_WORDS);
+    /* 编码器采样优先于定位插值/积分，DMA 唤醒采样任务时可及时抢占计算任务。 */
+    osThreadDef(odometryTask, odometry_task, osPriorityBelowNormal, 0, ODOMETRY_TASK_STACK_WORDS);
     task_handle = osThreadCreate(osThread(odometryTask), NULL);
     if (task_handle == NULL) {
         g_odometry.state = ODOMETRY_STATE_ERROR;

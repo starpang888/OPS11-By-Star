@@ -1,3 +1,6 @@
+/** @file mt6826s.h
+ * @brief modules 层 MT6826S 协议接口：15 位单圈角度、CRC、报警和配置寄存器访问。
+ */
 #ifndef MT6826S_H
 #define MT6826S_H
 
@@ -21,8 +24,8 @@ typedef enum {
     MT6826S_ERROR_CONFIGURATION
 } mt6826s_status_t;
 
-/* Owned by one task. select(true) asserts CS; the BSP provides CS timing.
-   transfer() clocks the entire buffer without releasing CS. */
+/* 总线由单个采样任务独占；select(true) 拉低片选，片选时序由 BSP 保证。
+   transfer 在一次片选内收发整个缓冲区，函数内部不主动结束片选。 */
 typedef struct {
     void *context;
     void (*select)(void *context, bool active);
@@ -30,11 +33,11 @@ typedef struct {
 } mt6826s_bus_t;
 
 typedef struct {
-    uint8_t raw[MT6826S_FRAME_BYTES]; /* Registers 0x003 through 0x006. */
+    uint8_t raw[MT6826S_FRAME_BYTES]; /* 对应寄存器 0x003～0x006，含角度、报警、CRC。 */
     uint8_t crc_calculated;
     uint8_t alarms;
     uint16_t angle_raw;
-    float angle_deg; /* [0, 360), usable only when the read returns MT6826S_OK. */
+    float angle_deg; /* 单圈角度 [0,360)，单位度；读取返回 MT6826S_OK 时才可用于控制。 */
 } mt6826s_sample_t;
 
 typedef struct {
@@ -60,12 +63,15 @@ uint8_t mt6826s_crc8(const uint8_t data[3]);
 mt6826s_status_t mt6826s_decode(const uint8_t raw[MT6826S_FRAME_BYTES], mt6826s_sample_t *sample);
 mt6826s_status_t mt6826s_read(const mt6826s_bus_t *bus, mt6826s_sample_t *sample);
 mt6826s_status_t mt6826s_read_register(const mt6826s_bus_t *bus, uint16_t address, uint8_t *value);
-/* Datasheet Figure 24: four ordinary reads, one CS interval per register.
-   The angle snapshot stays latched until registers 0x003..0x006 are consumed. */
+/* 手册图 24：四次普通寄存器读取，每次独立片选；角度快照在读完 0x003～0x006 前保持锁存。
+   此接口用于开发时核对读法，不应穿插周期 Burst 采样。 */
 mt6826s_status_t mt6826s_read_via_registers(const mt6826s_bus_t *bus, mt6826s_sample_t *sample);
 mt6826s_status_t mt6826s_read_diagnostics(const mt6826s_bus_t *bus, mt6826s_diagnostics_t *diagnostics);
-/* Volatile register change only, no EEPROM programming. Refuses an unexpected
-   starting BW; an already matching BW succeeds without a write. */
+/* 每步只访问一个寄存器：0=带宽、1=校准状态、2=校准控制。
+   调用者保存中间结果，三步都成功后再发布整组诊断值。 */
+mt6826s_status_t mt6826s_read_diagnostic_step(const mt6826s_bus_t *bus, unsigned step,
+                                            mt6826s_diagnostics_t *diagnostics);
+/* 只改运行寄存器，不烧写 EEPROM；拒绝非预期的初始带宽，已为目标值时直接成功。 */
 mt6826s_status_t mt6826s_set_bandwidth(const mt6826s_bus_t *bus, uint8_t expected_bandwidth,
                                     uint8_t target_bandwidth, mt6826s_bandwidth_change_t *change);
 

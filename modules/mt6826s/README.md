@@ -3,7 +3,7 @@
 依据 MagnTek《MT6826S 数据手册》中文版 Rev.1.1（2024-01）第 24~29、33、35、40 页。
 第一路已在板上读取到角度，普通寄存器读和连续读一致，CRC、格式和 IO 错误均为零。
 用户反馈第一路 BW 从 0 改为 5 后，正反向手拨快转的报警计数和角度波形均正常。
-用户已反馈两路数据正常。两路均设为 1 kHz，现加入各自的多圈位移和转速计算，运动计算部分待烧录确认。
+用户已反馈两路角度、多圈位移和转速正常。两路均设为 1 kHz；当前收尾配置关闭开发自检和运行期配置诊断，待重新烧录确认。
 动态角度精度和 SPI 电气波形仍需验证。
 
 ## 分层
@@ -77,7 +77,7 @@ CRC 使用多项式 `0x07`，MSB 先行，初值 `0x00`，无反射、无最终�
 
 ## DMA 实现与调试
 
-协议模块仍通过同步返回的 `bus.transfer()` 抽象访问总线，BSP 内部为 DMA + FreeRTOS 任务通知等待，不再逐字节轮询接收。启动诊断、普通寄存器访问、BW 读写及每秒诊断同样走 DMA，只有 SPI1/SPI2 使用此机制；SPI3/G354 保持现有 DRDY 通知和读取实现。
+协议模块仍通过同步返回的 `bus.transfer()` 抽象访问总线，BSP 内部为 DMA + FreeRTOS 任务通知等待，不再逐字节轮询接收。启动配置读取、可选的普通寄存器核对及 BW 读写同样走 DMA，只有 SPI1/SPI2 使用此机制；SPI3/G354 保持现有 DRDY 通知和读取实现。
 
 每路有独立、4 字节对齐的静态 TX/RX 缓冲区，位于 DMA 可访问的普通 SRAM；不要将其迁移到 CCMRAM。任务先拷贝命令，启动 DMA 后在自己的 direct notification 上等待最多 2 个 RTOS tick（当前 tick=1 ms，实际恢复还受任务调度影响）。只有短暂的 HAL 启动和完成状态交接使用临界区，线路传输和任务等待期间不屏蔽中断；关闭无用的半传输中断。
 
@@ -134,7 +134,7 @@ CRC 使用多项式 `0x07`，MSB 先行，初值 `0x00`，无反射、无最终�
 | `g_encoder.register_check.angle_difference_deg` | 两次读数的最短有符号角差，仅在两条路径校验通过时有意义 |
 | `g_encoder.register_check.nonzero_pair / passed` | 是否排除全零响应 / 本次静止对比是否符合 1 度容差 |
 | `g_encoder.register_check.checks / passes / timestamp_ms` | 对比次数 / 通过次数 / 最近对比完成时间 |
-| `g_encoder.bandwidth_change_evaluated` | 本次 MCU 启动是否已执行带宽设置步骤；通信核对通过后执行一次 |
+| `g_encoder.bandwidth_change_evaluated` | 本次 MCU 启动是否执行带宽设置步骤；启动配置读取成功后尝试一次 |
 | `g_encoder.bandwidth_change_status` | 设置步骤结果：0 成功、2 IO 错误、6 初始 BW 不符合预期或回读不符；仅 evaluated=true 时有效 |
 | `g_encoder.bandwidth_change.before_register / target_register / after_register` | 0x011 修改前 / 目标 / 回读原始值，包含保留位 |
 | `g_encoder.bandwidth_change.before_read_ok / after_read_ok` | 修改前读取 / 修改后读取是否传输成功；已经为目标档时复用初始读数 |
@@ -149,10 +149,10 @@ CRC 使用多项式 `0x07`，MSB 先行，初值 `0x00`，无反射、无最终�
 | `g_encoder.motion.discontinuities` | 丢失的连续片段数；持续错误不会每帧重复增加 |
 
 报警字段仅在当前帧 CRC 和格式通过时更新为相应报警；CRC/IO 失败时清除，不能据此认定芯片无报警。
-启动时及之后每秒，读取 0x011、0x113、0x155；临时 BW 设置在下文单独说明。
+默认只在启动时读取 0x011、0x113、0x155，运行期不再周期读取配置寄存器。`ENCODER_RUNTIME_DIAGNOSTICS_ENABLED=0` 是当前收尾配置；开发排查时可改为 1，此时每秒启动一组诊断，三次读取分散到三个采样周期，每周期最多追加一次传输，全部成功后发布结果。BW 设置只在启动诊断阶段尝试，方法在下文单独说明。
 单寄存器读取协议没有 CRC，`diagnostics_read_ok` 仅代表 HAL 传输成功，不能证明寄存器值正确；
 三项顺序读取也不是原子快照。读取失败保留上次诊断值，通过状态和时间识别是否过期。
-每次诊断后，按手册图 24 使用四个普通读命令分别读取 0x003~0x006，再额外连读一次角度。
+普通读取与连读对比仅供开发，默认 `ENCODER_STARTUP_REGISTER_CHECK_ENABLED=0`，`register_check` 各字段保留为 0 不代表故障。需要排查协议时改为 1 并重新编译：启动诊断后按手册图 24 使用四个普通读命令读取 0x003~0x006，再额外连读一次角度。此对比仅执行一次，进入周期采样后不会重复，`checks/passes` 不会持续增加。
 普通读数据也包含 CRC，可检查普通命令读取路径；两次角度采用圆周差值比较，容差为 1 度。
 `register_check.passed` 还要求两组数据各自不全为零，避免把悬空或不响应产生的全零数据当成通信证据。
 此对比不要求两帧属于同一采样时刻；只在轮子静止时判断，快速运动时角差变大不代表通信异常。
@@ -187,16 +187,16 @@ if (encoder_app_get_output_for(ENCODER_2, &encoder2)) {
 
 ### 核对 BW=0 的读数
 
-1. 烧录含 `register_check` 的当前 ELF，轮子停在明显非零的角度，等待至少两秒。
+1. 开发排查时先设置 `ENCODER_STARTUP_REGISTER_CHECK_ENABLED=1`，重新编译烧录，轮子停在明显非零的角度，等待至少两秒。
 2. 查看 `g_encoder.register_check.passed` 是否为 true，两条路径 CRC 是否通过，两个角度是否相近。
-3. 缓慢转到另一位置后停住，再次查看；两条路径应跟随位置变化，`passes` 应持续增加。
+3. 当前运行版本只在启动时执行该核对；如需在另一角度复核，请停稳后重启。两条路径应跟随启动位置变化，`passes` 保留本次启动结果。
 4. 如果普通读取始终为零而连读角度正常，或普通读 CRC 失败，先排查普通读协议和实物型号，不能据此修改 BW。
 5. 板上目前已通过该核对，继续进行下方 BW 对照。
 
 ### 临时将 BW=0 改为 5
 
 `application/encoder_config.h` 中 `ENCODER_BANDWIDTH_CHANGE_ENABLED=1` 启用本次对照，目标 `ENCODER_BANDWIDTH_TARGET=5`。
-每次 MCU 启动，每路独立在诊断读取成功且普通读与连读核对通过后，执行一次设置步骤：
+每次 MCU 启动，每路在配置寄存器读取成功后执行一次设置；若显式启用了开发读法对比，还要求对比通过：
 
 1. 重新读取 0x011，若 BW=0，以 `(old & 0xF8) | 5` 保留 Z_EDGE 和保留位。
 2. 使用 `60 11 data` 写运行寄存器，随后回读，要求整字节等于目标。
@@ -230,7 +230,7 @@ SPI1 和 SPI2 均为 5.25 MHz，每路每次角度传输 6 字节，纯时钟时
 
 - `state=1`、`error=0`、`valid=true`、`samples` 持续增加。
 - `sample_rate_hz=1000`；实际频率以各路 `measured_read_rate_hz` 为准，两路采样时刻并不严格同步。
-- `diagnostics.bandwidth=5`、`bandwidth_change.verified=true`；如果停在全零位置，通信证据检查会等待非零数据再设置 BW。
+- `diagnostics.bandwidth=5`、`bandwidth_change.verified=true`。默认模式不要求初始角度非零；只有启用开发读法对比时，零角度可能导致该核对不通过并跳过本次启动的 BW 设置。
 - CRC、格式、IO 和报警计数不增加，分别转动时各自的 `angle_deg` 跟随对应轮子。
 
 诊断、读路径核对和 BW 设置结果均单独保存，第二路不会使用第一路的核对结果来允许写入。
