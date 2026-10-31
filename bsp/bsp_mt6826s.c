@@ -1,3 +1,7 @@
+/** @file bsp_mt6826s.c
+ * @brief BSP 层双编码器 DMA 实现。任务发起收发，中断释放片选并通知对应任务。
+ *        每路拥有独立静态 SRAM 缓冲区；超时后先停止 DMA，确认停止后才复用缓冲区。
+ */
 #include "bsp_mt6826s.h"
 #include "bsp_time.h"
 #include "FreeRTOS.h"
@@ -24,8 +28,8 @@ typedef struct {
     volatile bool active;
     volatile bool success;
     bool ready;
-    /* DMA-accessible SRAM, independent of the caller's stack or flash buffer.
-       .data/.bss must remain in SRAM at 0x20000000, not CCM at 0x10000000. */
+    /* DMA 可访问的独立 SRAM 缓冲区，不依赖调用者栈或 Flash 数据。
+       .data/.bss 必须位于 0x20000000 普通 SRAM，不能放在 0x10000000 CCM。 */
     _Alignas(4) uint8_t tx[8];
     _Alignas(4) uint8_t rx[8];
     bsp_mt6826s_dma_stats_t stats;
@@ -41,8 +45,7 @@ static encoder_bus_context_t bus_contexts[BSP_MT6826S_COUNT] = {
 };
 
 static void cs_guard_delay(const encoder_bus_context_t *context) {
-    /* Each iteration executes at least one CPU cycle. This is a minimum delay,
-       not a precision clock; interrupts and task preemption may extend it. */
+    /* 保证片选建立/保持时间的最小延时；中断和任务抢占可能延长它。 */
     for (uint32_t i = 0; i < context->cs_guard_cycles; ++i) {
         __NOP();
     }
@@ -54,8 +57,8 @@ static void chip_select(void *context, bool active) {
         cs_guard_delay(device); /* TH >= half an SCK period after the final clock. */
     }
     if (active) {
-        /* Timestamp beside the CS edge, without task preemption between them.
-           This marks the latch request, not internal sensor filter latency. */
+        /* 记录时间与拉低片选之间禁止任务抢占。
+           时间戳表示锁存请求时刻，不包含传感器内部计算与滤波延迟补偿。 */
         taskENTER_CRITICAL();
         device->last_latch_ms = HAL_GetTick();
         device->last_latch_us = bsp_time_micros();
@@ -67,8 +70,8 @@ static void chip_select(void *context, bool active) {
     cs_guard_delay(device); /* TL >= 100 ns, and a gap between adjacent transactions. */
 }
 
-/* Called only from HAL SPI callbacks, after HAL has finished its IRQ work.
-   Successful TxRx completion follows HAL's end-of-wire BSY check. */
+/* 仅由 HAL SPI 中断回调进入；成功回调时 HAL 已完成线路 BSY 检查。
+   先释放片选、记录结果，再唤醒本路任务，避免任务继续读取尚未完成的数据。 */
 static void complete_from_isr(SPI_HandleTypeDef *spi, bool success) {
     const UBaseType_t mask = taskENTER_CRITICAL_FROM_ISR();
     for (unsigned i = 0; i < BSP_MT6826S_COUNT; ++i) {
@@ -107,8 +110,7 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *spi) {
     complete_from_isr(spi, false);
 }
 
-/* HAL's full-duplex DMA path leaves the TX stream error callback NULL.
-   Report a TX-side fault immediately instead of waiting for the task timeout. */
+/* HAL 全双工 DMA 默认未设置 TX 错误回调，在此补上以便立即报告发送侧故障。 */
 static void tx_dma_error(DMA_HandleTypeDef *dma) {
     SPI_HandleTypeDef *spi = dma->Parent;
     CLEAR_BIT(spi->Instance->CR2, SPI_CR2_TXDMAEN | SPI_CR2_RXDMAEN);
@@ -118,9 +120,9 @@ static void tx_dma_error(DMA_HandleTypeDef *dma) {
 
 static bool recover(encoder_bus_context_t *device) {
     SPI_HandleTypeDef *spi = device->spi;
-    /* Stop further peripheral requests/callbacks before quiescing BOTH streams.
-       HAL can clear CR2 DMA bits on error while a stream is still BUSY, so
-       HAL_SPI_Abort alone is insufficient. No blocking HAL call under BASEPRI. */
+    /* 先停止外设请求和回调，再分别中止收发两条 DMA 流。
+       错误路径可能已清除 CR2 请求位，但 DMA 仍忙，不能只调用 HAL_SPI_Abort。
+       会等待的 HAL 中止操作必须放在临界区外，避免屏蔽时基中断。 */
     taskENTER_CRITICAL();
     device->active = false;
     CLEAR_BIT(spi->Instance->CR2, SPI_CR2_TXDMAEN | SPI_CR2_RXDMAEN |
@@ -170,8 +172,8 @@ static bool transfer(void *context, const uint8_t *tx, uint8_t *rx, size_t lengt
     (void)ulTaskNotifyTake(pdTRUE, 0);
     memcpy(device->tx, tx, length);
     memset(device->rx, 0, sizeof(device->rx));
-    /* Protect HAL's setup, not the wire transfer or the completion wait.
-       RX can finish before HAL_SPI_TransmitReceive_DMA returns on a short frame. */
+    /* 短帧可能在 HAL 启动函数返回前就完成；临界区只保护启动和状态交接，
+       不覆盖线路传输及任务等待，以免长时间屏蔽中断。 */
     taskENTER_CRITICAL();
     device->success = false;
     device->active = true;

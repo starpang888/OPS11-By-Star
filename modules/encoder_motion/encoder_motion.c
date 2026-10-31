@@ -1,3 +1,6 @@
+/** @file encoder_motion.c
+ * @brief modules 层多圈展开与测速实现。处理 0/360 度跨越，使用真实毫秒间隔计算转速。
+ */
 #include "encoder_motion.h"
 
 #include <float.h>
@@ -62,8 +65,7 @@ void encoder_motion_update(encoder_motion_t *motion, uint16_t raw, uint32_t time
     const uint32_t elapsed_ms = (uint32_t)(timestamp_ms - motion->previous_ms);
     int32_t delta = (int32_t)raw - (int32_t)motion->previous_raw;
     const int32_t half_rev = (int32_t)counts_per_rev / 2;
-    /* Exactly half a revolution has no unique direction. A long gap is also
-       ambiguous even if the two endpoint angles happen to look close. */
+    /* 恰好半圈无法确定方向；间隔过长时，即使端点角度接近也不能保证未跨多圈。 */
     if ((elapsed_ms > motion->config.max_gap_ms) || (delta == half_rev) || (delta == -half_rev)) {
         encoder_motion_invalidate(motion);
         anchor(motion, raw, timestamp_ms);
@@ -94,11 +96,10 @@ void encoder_motion_update(encoder_motion_t *motion, uint16_t raw, uint32_t time
         const float alpha = (float)window_elapsed_ms /
                             ((float)motion->config.speed_filter_tau_ms + (float)window_elapsed_ms);
         motion->output.speed_raw_rpm = rpm;
-        /* Start the filter from zero after reset/invalidation, rather than
-           treating the first window as a settled measurement. */
+        /* 重置或失效后滤波器从零起步，首个测速窗口不视为已稳定的测量值。 */
         motion->output.speed_rpm += alpha * (rpm - motion->output.speed_rpm);
-        /* With zero input, the correction can round to zero at the smallest
-           subnormal float and leave a permanent residue. Clear only that tail. */
+        /* 零输入下滤波尾部可能停在极小的非规格化浮点数，例如 1.4013e-45。
+           仅清除此数值尾巴，不对真实小转速添加人为死区。 */
         if ((rpm == 0.0f) && (motion->output.speed_rpm > -FLT_MIN) &&
             (motion->output.speed_rpm < FLT_MIN)) {
             motion->output.speed_rpm = 0.0f;

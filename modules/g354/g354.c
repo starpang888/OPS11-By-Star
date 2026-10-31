@@ -1,8 +1,11 @@
+/** @file g354.c
+ * @brief modules 层 G354 协议实现：窗口寄存器访问、手册要求的字间等待和 17 字 Burst 解码。
+ */
 #include "g354.h"
 
 #include <string.h>
 
-/* M-G354PDH0 Rev.20160212, sections 6-8. Register writes are byte-wide. */
+/* 依据 M-G354PDH0 Rev.20160212 第 6～8 节；寄存器写入按字节进行。 */
 enum {
     REG_MODE_CTRL = 0x02,
     REG_DIAG_STAT = 0x04,
@@ -47,7 +50,7 @@ static g354_status_t read_word(g354_t *device, uint8_t address, uint16_t *value)
     bool ok = bus->transfer(bus->context, (uint16_t)(address << 8), &unused);
     bus->delay_us(bus->context, NORMAL_STALL_US);
     if (ok) {
-        ok = bus->transfer(bus->context, 0, value); /* Pipelined response to the preceding command. */
+        ok = bus->transfer(bus->context, 0, value); /* 流水响应：本次返回的是前一个读命令的数据。 */
         bus->delay_us(bus->context, NORMAL_STALL_US);
     }
     bus->select(bus->context, false);
@@ -106,7 +109,7 @@ static g354_status_t set_mode(g354_t *device, bool sampling) {
     return G354_ERROR_TIMEOUT;
 }
 
-/* Return immediately on a failed bus operation; never continue configuring an unknown state. */
+/* 总线访问失败立即返回，避免在未知器件状态下继续写配置。 */
 #define CHECK(operation) do { const g354_status_t result = (operation); if (result != G354_OK) return result; } while (0)
 
 g354_status_t g354_initialise(g354_t *device, const g354_bus_t *bus) {
@@ -118,13 +121,13 @@ g354_status_t g354_initialise(g354_t *device, const g354_bus_t *bus) {
     device->bus = *bus;
     bus->select(bus->context, false);
     bus->reset(bus->context, true);
-    bus->delay_ms(bus->context, 100); /* /RST low pulse minimum: 100 ms. */
+    bus->delay_ms(bus->context, 100); /* 手册要求 /RST 低电平至少保持 100 ms。 */
     bus->reset(bus->context, false);
     bus->delay_ms(bus->context, 800);
 
     CHECK(select_window(device, 1));
     CHECK(poll_clear(device, REG_GLOB_CMD, 0x0400, 1000));
-    CHECK(set_mode(device, false)); /* Also handles a persisted UART AUTO_START setting. */
+    CHECK(set_mode(device, false)); /* 同时处理器件已保存 UART 自动启动配置的情况。 */
     CHECK(read_word(device, REG_DIAG_STAT, &device->diagnostic));
     if ((device->diagnostic & 0x7B7FU) != 0) {
         return G354_ERROR_DIAGNOSTIC;
@@ -143,14 +146,14 @@ g354_status_t g354_initialise(g354_t *device, const g354_bus_t *bus) {
     }
     CHECK(read_word(device, REG_VERSION, &device->firmware_version));
 
-    /* Explicit configuration overrides saved settings without changing IMU non-volatile memory. */
+    /* 每次上电明确写入所需配置，覆盖已保存设置，但不改动 IMU 非易失存储。 */
     CHECK(write_byte(device, REG_UART_CTRL, 0)); /* SPI requires UART_AUTO=0; AUTO_START=0. */
     CHECK(write_byte(device, REG_UART_CTRL + 1, 0));
     CHECK(write_byte(device, REG_SIG_CTRL, 0));
     CHECK(write_byte(device, REG_SIG_CTRL + 1, 0xFE)); /* Temperature and six-axis new-data flags. */
     CHECK(write_byte(device, REG_MSC_CTRL, 0x06)); /* DRDY enabled/active high; no external trigger. */
-    CHECK(write_byte(device, REG_SMPL_CTRL + 1, 0x02)); /* 500 samples/s. */
-    CHECK(write_byte(device, REG_FILTER_CTRL, 0x02)); /* Moving average, 4 taps. */
+    CHECK(write_byte(device, REG_SMPL_CTRL + 1, 0x02)); /* 输出采样率 500 Hz。 */
+    CHECK(write_byte(device, REG_FILTER_CTRL, 0x02)); /* 4 点移动平均滤波。 */
     bus->delay_ms(bus->context, 1);
     CHECK(poll_clear(device, REG_FILTER_CTRL, 0x0020, 100));
     CHECK(write_byte(device, REG_BURST_CTRL1, 0x03)); /* COUNT + CHECKSUM, GPIO excluded. */
@@ -166,7 +169,7 @@ g354_status_t g354_initialise(g354_t *device, const g354_bus_t *bus) {
     CHECK(check_word(device, REG_BURST_CTRL1, 0xFC07, 0xF003));
     CHECK(check_word(device, REG_BURST_CTRL2, 0x7C00, 0x7000));
     CHECK(check_word(device, REG_POL_CTRL, 0x007E, 0));
-    CHECK(select_window(device, 0)); /* All sampling access remains in window 0. */
+    CHECK(select_window(device, 0)); /* 后续采样访问固定在窗口 0。 */
     device->configured = true;
     return G354_OK;
 }

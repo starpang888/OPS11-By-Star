@@ -25,6 +25,8 @@
 #include "imu_app.h"
 #include "encoder_app.h"
 #include "odometry_app.h"
+#include "telemetry_app.h"
+#include "display_app.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -58,6 +60,7 @@ TIM_HandleTypeDef htim2;
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 UART_HandleTypeDef huart3;
+DMA_HandleTypeDef hdma_usart2_tx;
 
 osThreadId defaultTaskHandle;
 osThreadId imuTaskHandle;
@@ -159,6 +162,8 @@ int main(void)
   /* USER CODE BEGIN RTOS_THREADS */
   (void)encoder_app_start(); /* Failures remain visible in g_encoder/g_encoder2.error. */
   (void)odometry_app_start(); /* Coordinates and tracking status: g_odometry. */
+  (void)telemetry_app_start(); /* USART2 DMA pose output: g_telemetry. */
+  (void)display_app_start(); /* I2C3 OLED：显示 X/Y/Yaw，状态见 g_display。 */
   /* USER CODE END RTOS_THREADS */
 
   /* Start scheduler */
@@ -531,6 +536,9 @@ static void MX_DMA_Init(void)
   /* DMA1_Stream4_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Stream4_IRQn, 6, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream4_IRQn);
+  /* DMA1_Stream6_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream6_IRQn, 6, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream6_IRQn);
   /* DMA2_Stream0_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 6, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
